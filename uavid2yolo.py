@@ -5,8 +5,10 @@ from tqdm import tqdm
 import shutil
 
 # ====================== 配置参数 ======================
-# 你要提取的目标类别（此处以 'static car' 为例，ID=3）
-TARGET_CLASS_ID = 3  # 0:clutter, 1:building, 2:road, 3:static car, 4:tree, 5:vegetation, 6:human, 7:moving car
+# 你要提取的目标类别（可以指定多个类别ID）
+TARGET_CLASS_IDS = [3, 7]  # 3: static car, 7: moving car
+MERGE_CLASSES = True        # True: 将多个类别合并为一类; False: 分别保留原类别ID
+MERGED_CLASS_ID = 0         # 合并后的类别ID（YOLO类别从0开始）
 
 # 类别对应的RGB颜色 (用于从标签图中筛选)
 CLASS_RGB_MAP = {
@@ -19,10 +21,21 @@ CLASS_RGB_MAP = {
     6: (64, 64, 0),
     7: (64, 0, 128),
 }
-TARGET_RGB = CLASS_RGB_MAP[TARGET_CLASS_ID]
+
+# 类别名称映射（用于生成data.yaml）
+CLASS_NAMES = {
+    0: 'clutter',
+    1: 'building',
+    2: 'road',
+    3: 'static_car',
+    4: 'tree',
+    5: 'vegetation',
+    6: 'human',
+    7: 'moving_car'
+}
 
 # 数据路径
-DATA_ROOT = "./dataset"          # UAVid原始数据集根目录
+DATA_ROOT = "./uavid/"          # UAVid原始数据集根目录
 OUTPUT_ROOT = "./yolo_dataset"   # 输出YOLO数据集的根目录
 
 # ====================== 重命名开关 ======================
@@ -31,9 +44,14 @@ COPY_IMAGES = True               # True: 复制图片; False: 创建软链接（
 
 
 # ====================== 核心转换函数 ======================
-def convert_mask_to_yolo(mask_path, img_shape, target_rgb, class_id, min_area=50):
+def convert_mask_to_yolo(mask_path, img_shape, target_rgb_list, target_class_ids, merge_classes, merged_class_id, min_area=50):
     """
     从语义分割掩码中提取目标类别的边界框，转为YOLO格式
+    参数:
+        target_rgb_list: 目标类别的RGB颜色列表
+        target_class_ids: 目标类别ID列表
+        merge_classes: 是否合并类别
+        merged_class_id: 合并后的类别ID
     返回: list of [class_id, x_center, y_center, width, height] (归一化)
     """
     # 读取掩码 (BGR格式)
@@ -41,40 +59,48 @@ def convert_mask_to_yolo(mask_path, img_shape, target_rgb, class_id, min_area=50
     if mask is None:
         return []
     
-    # 生成二值掩码：像素颜色等于目标RGB的置为255，其余为0
-    target_bgr = (target_rgb[2], target_rgb[1], target_rgb[0])  # RGB -> BGR
-    lower = np.array(target_bgr, dtype=np.uint8)
-    upper = np.array(target_bgr, dtype=np.uint8)
-    binary_mask = cv2.inRange(mask, lower, upper)
-    
-    # 寻找连通区域的外轮廓
-    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
     h, w = img_shape[:2]
     yolo_annos = []
     
-    for cnt in contours:
-        # 过滤掉过小的噪声区域
-        area = cv2.contourArea(cnt)
-        if area < min_area:
-            continue
+    # 对每个目标类别分别提取
+    for target_rgb, class_id in zip(target_rgb_list, target_class_ids):
+        # 生成二值掩码：像素颜色等于目标RGB的置为255，其余为0
+        target_bgr = (target_rgb[2], target_rgb[1], target_rgb[0])  # RGB -> BGR
+        lower = np.array(target_bgr, dtype=np.uint8)
+        upper = np.array(target_bgr, dtype=np.uint8)
+        binary_mask = cv2.inRange(mask, lower, upper)
         
-        # 计算最小外接矩形 (轴对齐)
-        x, y, bw, bh = cv2.boundingRect(cnt)
+        # 寻找连通区域的外轮廓
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # 转换为YOLO归一化坐标
-        x_center = (x + bw / 2.0) / w
-        y_center = (y + bh / 2.0) / h
-        width = bw / w
-        height = bh / h
-        
-        # 坐标截断防止越界
-        x_center = min(max(x_center, 0.0), 1.0)
-        y_center = min(max(y_center, 0.0), 1.0)
-        width = min(width, 1.0)
-        height = min(height, 1.0)
-        
-        yolo_annos.append([class_id, x_center, y_center, width, height])
+        for cnt in contours:
+            # 过滤掉过小的噪声区域
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                continue
+            
+            # 计算最小外接矩形 (轴对齐)
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            
+            # 转换为YOLO归一化坐标
+            x_center = (x + bw / 2.0) / w
+            y_center = (y + bh / 2.0) / h
+            width = bw / w
+            height = bh / h
+            
+            # 坐标截断防止越界
+            x_center = min(max(x_center, 0.0), 1.0)
+            y_center = min(max(y_center, 0.0), 1.0)
+            width = min(width, 1.0)
+            height = min(height, 1.0)
+            
+            # 根据是否合并类别决定使用的class_id
+            if merge_classes:
+                final_class_id = merged_class_id
+            else:
+                final_class_id = class_id
+            
+            yolo_annos.append([final_class_id, x_center, y_center, width, height])
     
     return yolo_annos
 
@@ -113,7 +139,7 @@ def process_split(split_name):
     for seq in tqdm(seq_dirs, desc=f"处理 {split_name}"):
         seq_path = os.path.join(src_split_dir, seq)
         img_dir = os.path.join(seq_path, "images")
-        label_dir = os.path.join(seq_path, "labele")  # 注意: UAVid文件夹名是 'labele'
+        label_dir = os.path.join(seq_path, "labels")  # 注意: UAVid文件夹名是 'labels'
         
         # 对于 test 集，没有 label 文件夹，直接跳过
         if not os.path.exists(label_dir):
@@ -133,8 +159,14 @@ def process_split(split_name):
                 continue
             img_shape = img.shape
             
+            # 获取目标类别的RGB颜色列表
+            target_rgb_list = [CLASS_RGB_MAP[id] for id in TARGET_CLASS_IDS]
+            
             # 执行转换，获得YOLO标注
-            yolo_annos = convert_mask_to_yolo(label_path, img_shape, TARGET_RGB, TARGET_CLASS_ID)
+            yolo_annos = convert_mask_to_yolo(
+                label_path, img_shape, target_rgb_list, TARGET_CLASS_IDS, 
+                MERGE_CLASSES, MERGED_CLASS_ID
+            )
             
             # 如果该图没有目标对象，则跳过
             if len(yolo_annos) == 0:
@@ -175,20 +207,31 @@ def process_split(split_name):
 # ====================== 生成 data.yaml ======================
 def create_data_yaml():
     """生成YOLO数据集配置文件"""
+    # 确定类别名称
+    if MERGE_CLASSES:
+        # 合并后的类别名称
+        class_names = ['car']  # 可以根据需要修改
+        nc = 1
+    else:
+        # 分别保留原始类别名称
+        class_names = [CLASS_NAMES[id] for id in TARGET_CLASS_IDS]
+        nc = len(TARGET_CLASS_IDS)
+    
+    # 生成类别名称描述
+    class_names_str = '[' + ', '.join([f"'{name}'" for name in class_names]) + ']'
+    
     yaml_content = f"""# UAVid 转 YOLO 数据集配置
-# 目标类别: {TARGET_CLASS_ID} - {list(CLASS_RGB_MAP.keys()).index(TARGET_CLASS_ID) if TARGET_CLASS_ID in CLASS_RGB_MAP else 'unknown'}
+# 目标类别: {TARGET_CLASS_IDS}
+# 是否合并: {MERGE_CLASSES}
+# 类别数量: {nc}
 
 path: {OUTPUT_ROOT}
 train: images/train
 val: images/val
 test: images/test
 
-
-
-
-
-nc: 1
-names: ['{list(CLASS_RGB_MAP.values())[TARGET_CLASS_ID]}']
+nc: {nc}
+names: {class_names_str}
 """
     yaml_path = os.path.join(OUTPUT_ROOT, "data.yaml")
     with open(yaml_path, 'w') as f:
@@ -200,7 +243,10 @@ names: ['{list(CLASS_RGB_MAP.values())[TARGET_CLASS_ID]}']
 if __name__ == "__main__":
     print("=" * 60)
     print("UAVid -> YOLO 格式转换器")
-    print(f"目标类别 ID: {TARGET_CLASS_ID}")
+    print(f"目标类别 ID: {TARGET_CLASS_IDS}")
+    print(f"合并类别: {'是' if MERGE_CLASSES else '否'}")
+    if MERGE_CLASSES:
+        print(f"合并后类别ID: {MERGED_CLASS_ID}")
     print(f"重命名开关: {'开启' if RENAME_IMAGES else '关闭'}")
     print(f"复制模式: {'复制图片' if COPY_IMAGES else '创建软链接'}")
     print("=" * 60)
